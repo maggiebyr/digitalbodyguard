@@ -156,8 +156,9 @@ class SpiderFootClient {
     }
 
     const targetString = targets.map((t) => t.value).join(",");
+    console.log(`[SpiderFoot] Starting scan for targets: ${targetString}`);
 
-    // SpiderFoot REST API format
+    // SpiderFoot REST API format - uses form-encoded POST
     const formData = new URLSearchParams();
     formData.append("scanname", name);
     formData.append("scantarget", targetString);
@@ -169,20 +170,32 @@ class SpiderFootClient {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json",
         ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}),
       },
       body: formData.toString(),
     });
 
     if (!response.ok) {
-      throw new Error(`Failed to start scan: ${response.status}`);
+      const errorText = await response.text();
+      throw new Error(`Failed to start scan: ${response.status} - ${errorText}`);
     }
 
     const data = await response.json();
+    console.log("[SpiderFoot] Start scan response:", data);
 
-    // SpiderFoot returns scan ID in different formats depending on version
-    const scanId = data.scanId || data.id || data.scan_id;
+    // SpiderFoot returns ["SUCCESS", scanId] or ["ERROR", message]
+    if (Array.isArray(data)) {
+      if (data[0] === "SUCCESS" && data[1]) {
+        return data[1];
+      }
+      if (data[0] === "ERROR") {
+        throw new Error(`SpiderFoot error: ${data[1]}`);
+      }
+    }
 
+    // Fallback for other response formats
+    const scanId = data.scanId || data.id || data.scan_id || data[1];
     if (!scanId) {
       throw new Error("No scan ID returned from SpiderFoot");
     }
@@ -199,10 +212,15 @@ class SpiderFootClient {
       return this.getDemoResults(scanId);
     }
 
+    console.log(`[SpiderFoot] Getting status for scan: ${scanId}`);
+
     const statusResponse = await fetch(
       `${this.baseUrl}/scanstatus?id=${scanId}`,
       {
-        headers: this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {},
+        headers: {
+          Accept: "application/json",
+          ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}),
+        },
       }
     );
 
@@ -211,12 +229,20 @@ class SpiderFootClient {
     }
 
     const statusData = await statusResponse.json();
+    console.log("[SpiderFoot] Status response:", statusData);
+
+    // SpiderFoot returns: [scanId, scanName, created, started, ended, status, riskmatrix]
+    // Status is at index 5
+    const sfStatus = Array.isArray(statusData) ? statusData[5] : statusData.status;
 
     // Get scan results/events
     const eventsResponse = await fetch(
       `${this.baseUrl}/scaneventresults?id=${scanId}`,
       {
-        headers: this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {},
+        headers: {
+          Accept: "application/json",
+          ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}),
+        },
       }
     );
 
@@ -224,9 +250,10 @@ class SpiderFootClient {
     if (eventsResponse.ok) {
       const eventsData = await eventsResponse.json();
       events = this.parseSpiderFootEvents(eventsData);
+      console.log(`[SpiderFoot] Found ${events.length} events`);
     }
 
-    // Calculate progress based on status
+    // Map SpiderFoot status to our status
     const statusMap: Record<string, "running" | "completed" | "failed"> = {
       RUNNING: "running",
       STARTED: "running",
@@ -238,9 +265,14 @@ class SpiderFootClient {
       ERROR: "failed",
     };
 
-    const status = statusMap[statusData.status] || "running";
-    const progress =
-      status === "completed" ? 100 : statusData.progress || 50;
+    const status = statusMap[sfStatus] || "running";
+
+    // Estimate progress based on events count if status is running
+    let progress = status === "completed" ? 100 : 50;
+    if (status === "running" && events.length > 0) {
+      // Rough estimate: more events = more progress (cap at 90% until complete)
+      progress = Math.min(90, 10 + events.length * 2);
+    }
 
     return {
       scanId,
@@ -252,19 +284,35 @@ class SpiderFootClient {
 
   /**
    * Parse SpiderFoot event results into our format
+   * SpiderFoot returns: [lastseen, eventType, eventData, module, sourceData, sourceModule, ...]
    */
   private parseSpiderFootEvents(data: unknown): SpiderFootEvent[] {
     if (!Array.isArray(data)) {
       return [];
     }
 
-    return data.map((item: Record<string, unknown>) => ({
-      type: String(item.type || item.event_type || "UNKNOWN"),
-      module: String(item.module || item.source_module || "unknown"),
-      data: String(item.data || item.event_data || ""),
-      source: String(item.source || item.source_entity || ""),
-      confidence: Number(item.confidence || item.certainty || 100),
-    }));
+    return data.map((item) => {
+      // Handle array format from scaneventresults
+      if (Array.isArray(item)) {
+        return {
+          type: String(item[1] || "UNKNOWN"),      // eventType at index 1
+          data: String(item[2] || ""),              // eventData at index 2
+          module: String(item[3] || "unknown"),     // module at index 3
+          source: String(item[5] || ""),            // sourceModule at index 5
+          confidence: 100,
+        };
+      }
+
+      // Handle object format (fallback)
+      const obj = item as Record<string, unknown>;
+      return {
+        type: String(obj.type || obj.event_type || "UNKNOWN"),
+        module: String(obj.module || obj.source_module || "unknown"),
+        data: String(obj.data || obj.event_data || ""),
+        source: String(obj.source || obj.source_entity || ""),
+        confidence: Number(obj.confidence || obj.certainty || 100),
+      };
+    });
   }
 
   /**

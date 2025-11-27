@@ -1,0 +1,47 @@
+version: "3.8"
+
+services:
+  # SpiderFoot OSINT Engine
+  spiderfoot:
+    build:
+      context: ./services/spiderfoot
+      dockerfile: Dockerfile
+    ports:
+      - "5001:5001"
+    environment:
+      - SF_DEBUG=1
+    volumes:
+      - spiderfoot_data:/var/lib/spiderfoot
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis for local development (mirrors Upstash)
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  # PostgreSQL for local development (mirrors Supabase)
+  postgres:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: digitalbodyguard
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  spiderfoot_data:
+  redis_data:
+  postgres_data:
