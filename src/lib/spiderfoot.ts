@@ -1,7 +1,9 @@
 /**
  * SpiderFoot OSINT Engine Client
- * Handles communication with SpiderFoot instance and enrichment loop
+ * Production-ready integration with SpiderFoot HX REST API
  */
+
+import crypto from "crypto";
 
 // Consumer audit modules organized by purpose
 export const CONSUMER_AUDIT_MODULES = {
@@ -59,6 +61,7 @@ export interface SpiderFootEvent {
   data: string;
   source?: string;
   confidence?: number;
+  enrichmentPass?: number;
 }
 
 export interface ScanTarget {
@@ -73,19 +76,42 @@ export interface ScanResult {
   progress?: number;
 }
 
+interface SpiderFootAPIResponse {
+  success?: boolean;
+  data?: unknown;
+  error?: string;
+}
+
 class SpiderFootClient {
   private baseUrl: string;
   private apiKey?: string;
+  private isConfigured: boolean;
 
   constructor() {
-    this.baseUrl = process.env.SPIDERFOOT_API_URL || "http://localhost:5001";
+    this.baseUrl = process.env.SPIDERFOOT_API_URL || "";
     this.apiKey = process.env.SPIDERFOOT_API_KEY;
+    this.isConfigured = !!this.baseUrl;
   }
 
-  private async request(endpoint: string, options?: RequestInit) {
+  /**
+   * Check if SpiderFoot is properly configured
+   */
+  isReady(): boolean {
+    return this.isConfigured;
+  }
+
+  private async request<T = SpiderFootAPIResponse>(
+    endpoint: string,
+    options?: RequestInit
+  ): Promise<T> {
+    if (!this.isConfigured) {
+      throw new Error("SpiderFoot is not configured. Set SPIDERFOOT_API_URL.");
+    }
+
     const url = `${this.baseUrl}${endpoint}`;
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
+      Accept: "application/json",
       ...(options?.headers as Record<string, string>),
     };
 
@@ -93,49 +119,79 @@ class SpiderFootClient {
       headers["Authorization"] = `Bearer ${this.apiKey}`;
     }
 
-    const response = await fetch(url, {
-      ...options,
-      headers,
-    });
+    try {
+      const response = await fetch(url, {
+        ...options,
+        headers,
+      });
 
-    if (!response.ok) {
-      throw new Error(`SpiderFoot API error: ${response.status}`);
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(
+          `SpiderFoot API error: ${response.status} - ${errorText}`
+        );
+      }
+
+      return response.json() as Promise<T>;
+    } catch (error) {
+      if (error instanceof Error) {
+        throw new Error(`SpiderFoot request failed: ${error.message}`);
+      }
+      throw error;
     }
-
-    return response.json();
   }
 
   /**
-   * Start a new scan
+   * Start a new scan with SpiderFoot
    */
   async startScan(
     name: string,
     targets: ScanTarget[],
     modules: string[] = ALL_MODULES
   ): Promise<string> {
-    // For demo/development mode without SpiderFoot
-    if (!process.env.SPIDERFOOT_API_URL) {
-      console.warn("SpiderFoot not configured. Using demo mode.");
+    // Use demo mode if not configured
+    if (!this.isConfigured) {
+      console.warn("[SpiderFoot] Not configured - using demo mode");
       return `demo_scan_${Date.now()}`;
     }
 
     const targetString = targets.map((t) => t.value).join(",");
 
-    const data = await this.request("/scan", {
+    // SpiderFoot REST API format
+    const formData = new URLSearchParams();
+    formData.append("scanname", name);
+    formData.append("scantarget", targetString);
+    formData.append("modulelist", modules.join(","));
+    formData.append("typelist", "");
+    formData.append("usecase", "all");
+
+    const response = await fetch(`${this.baseUrl}/startscan`, {
       method: "POST",
-      body: JSON.stringify({
-        scanname: name,
-        scantarget: targetString,
-        modules: modules.join(","),
-        usecase: "all",
-      }),
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}),
+      },
+      body: formData.toString(),
     });
 
-    return data.scanId || data.id;
+    if (!response.ok) {
+      throw new Error(`Failed to start scan: ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    // SpiderFoot returns scan ID in different formats depending on version
+    const scanId = data.scanId || data.id || data.scan_id;
+
+    if (!scanId) {
+      throw new Error("No scan ID returned from SpiderFoot");
+    }
+
+    return scanId;
   }
 
   /**
-   * Get scan status and results
+   * Get scan status
    */
   async getScanStatus(scanId: string): Promise<ScanResult> {
     // Demo mode
@@ -143,15 +199,72 @@ class SpiderFootClient {
       return this.getDemoResults(scanId);
     }
 
-    const status = await this.request(`/scan/${scanId}/status`);
-    const events = await this.request(`/scan/${scanId}/data`);
+    const statusResponse = await fetch(
+      `${this.baseUrl}/scanstatus?id=${scanId}`,
+      {
+        headers: this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {},
+      }
+    );
+
+    if (!statusResponse.ok) {
+      throw new Error(`Failed to get scan status: ${statusResponse.status}`);
+    }
+
+    const statusData = await statusResponse.json();
+
+    // Get scan results/events
+    const eventsResponse = await fetch(
+      `${this.baseUrl}/scaneventresults?id=${scanId}`,
+      {
+        headers: this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {},
+      }
+    );
+
+    let events: SpiderFootEvent[] = [];
+    if (eventsResponse.ok) {
+      const eventsData = await eventsResponse.json();
+      events = this.parseSpiderFootEvents(eventsData);
+    }
+
+    // Calculate progress based on status
+    const statusMap: Record<string, "running" | "completed" | "failed"> = {
+      RUNNING: "running",
+      STARTED: "running",
+      STARTING: "running",
+      FINISHED: "completed",
+      COMPLETED: "completed",
+      ABORTED: "failed",
+      FAILED: "failed",
+      ERROR: "failed",
+    };
+
+    const status = statusMap[statusData.status] || "running";
+    const progress =
+      status === "completed" ? 100 : statusData.progress || 50;
 
     return {
       scanId,
-      status: status.status === "FINISHED" ? "completed" : "running",
-      events: events.data || [],
-      progress: status.progress || 0,
+      status,
+      events,
+      progress,
     };
+  }
+
+  /**
+   * Parse SpiderFoot event results into our format
+   */
+  private parseSpiderFootEvents(data: unknown): SpiderFootEvent[] {
+    if (!Array.isArray(data)) {
+      return [];
+    }
+
+    return data.map((item: Record<string, unknown>) => ({
+      type: String(item.type || item.event_type || "UNKNOWN"),
+      module: String(item.module || item.source_module || "unknown"),
+      data: String(item.data || item.event_data || ""),
+      source: String(item.source || item.source_entity || ""),
+      confidence: Number(item.confidence || item.certainty || 100),
+    }));
   }
 
   /**
@@ -159,17 +272,31 @@ class SpiderFootClient {
    */
   async stopScan(scanId: string): Promise<void> {
     if (scanId.startsWith("demo_")) return;
+    if (!this.isConfigured) return;
 
-    await this.request(`/scan/${scanId}/stop`, {
-      method: "POST",
+    await fetch(`${this.baseUrl}/stopscan?id=${scanId}`, {
+      method: "GET",
+      headers: this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {},
     });
   }
 
   /**
-   * Generate demo results for development
+   * Delete a scan and its data
+   */
+  async deleteScan(scanId: string): Promise<void> {
+    if (scanId.startsWith("demo_")) return;
+    if (!this.isConfigured) return;
+
+    await fetch(`${this.baseUrl}/scandelete?id=${scanId}`, {
+      method: "GET",
+      headers: this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {},
+    });
+  }
+
+  /**
+   * Generate demo results for development/testing
    */
   private getDemoResults(scanId: string): ScanResult {
-    // Simulate progressive results
     const elapsed = Date.now() - parseInt(scanId.replace("demo_scan_", ""));
     const progress = Math.min(100, Math.floor(elapsed / 1000 / 3) * 10);
     const isComplete = progress >= 100;
@@ -247,7 +374,6 @@ class SpiderFootClient {
       },
     ];
 
-    // Return progressively more events as time goes on
     const eventsToReturn = demoEvents.slice(
       0,
       Math.ceil((progress / 100) * demoEvents.length)
@@ -262,7 +388,9 @@ class SpiderFootClient {
   }
 }
 
-// Enrichment Engine for multi-pass scanning
+/**
+ * Enrichment Engine for multi-pass scanning
+ */
 export class EnrichmentEngine {
   private sf: SpiderFootClient;
   private maxPasses: number;
@@ -293,14 +421,14 @@ export class EnrichmentEngine {
     name: string,
     email: string,
     phone?: string,
-    onProgress?: (progress: number, stage: string) => void
+    onProgress?: (progress: number, stage: string) => Promise<void> | void
   ): Promise<{ scanIds: string[]; events: SpiderFootEvent[] }> {
     const scanIds: string[] = [];
     const originalInputs = new Set([email, name]);
     if (phone) originalInputs.add(phone);
 
     // Pass 1: Initial scan
-    onProgress?.(10, "Starting initial scan...");
+    await onProgress?.(10, "Starting initial scan...");
 
     const targets: ScanTarget[] = [
       { value: email, type: "EMAILADDR" },
@@ -314,9 +442,9 @@ export class EnrichmentEngine {
     scanIds.push(scanId1);
 
     // Wait for initial scan to complete
-    const pass1Results = await this.waitForScan(scanId1, (p) =>
-      onProgress?.(10 + p * 0.4, "Scanning data sources...")
-    );
+    const pass1Results = await this.waitForScan(scanId1, async (p) => {
+      await onProgress?.(10 + p * 0.4, "Scanning data sources...");
+    });
 
     this.allFindings.push(...pass1Results.events);
     this.extractNewTargets(pass1Results.events);
@@ -326,24 +454,23 @@ export class EnrichmentEngine {
       const newTargets = this.getUnseenTargets(originalInputs);
 
       if (newTargets.length === 0) {
-        onProgress?.(100, "No new targets to scan");
+        await onProgress?.(100, "No new targets to scan");
         break;
       }
 
-      onProgress?.(
+      await onProgress?.(
         50 + (passNum - 2) * 20,
         `Enrichment pass ${passNum} - scanning discovered identities...`
       );
 
       const scanId = await this.sf.startScan(
         `${name} - Pass ${passNum}`,
-        newTargets.slice(0, 10) // Limit to prevent runaway scans
+        newTargets.slice(0, 10)
       );
       scanIds.push(scanId);
 
-      const passResults = await this.waitForScan(scanId, () => {});
+      const passResults = await this.waitForScan(scanId, async () => {});
 
-      // Mark enrichment pass on events
       const enrichedEvents = passResults.events.map((e) => ({
         ...e,
         enrichmentPass: passNum,
@@ -351,39 +478,35 @@ export class EnrichmentEngine {
 
       this.allFindings.push(...enrichedEvents);
       this.extractNewTargets(passResults.events);
-
-      // Add scanned targets to original inputs to avoid re-scanning
       newTargets.forEach((t) => originalInputs.add(t.value));
     }
 
-    onProgress?.(100, "Scan complete");
+    await onProgress?.(100, "Scan complete");
 
-    // Deduplicate findings
     const dedupedFindings = this.deduplicateFindings(this.allFindings);
-
     return { scanIds, events: dedupedFindings };
   }
 
   private async waitForScan(
     scanId: string,
-    onProgress: (progress: number) => void
+    onProgress: (progress: number) => Promise<void> | void
   ): Promise<ScanResult> {
     let attempts = 0;
     const maxAttempts = 120; // 10 minutes max
 
     while (attempts < maxAttempts) {
       const result = await this.sf.getScanStatus(scanId);
-      onProgress(result.progress || 0);
+      await onProgress(result.progress || 0);
 
       if (result.status === "completed" || result.status === "failed") {
         return result;
       }
 
-      await new Promise((resolve) => setTimeout(resolve, 5000)); // Poll every 5s
+      await new Promise((resolve) => setTimeout(resolve, 5000));
       attempts++;
     }
 
-    throw new Error("Scan timeout");
+    throw new Error("Scan timeout after 10 minutes");
   }
 
   private extractNewTargets(events: SpiderFootEvent[]): void {
@@ -407,10 +530,6 @@ export class EnrichmentEngine {
   }
 
   private parseUsername(data: string): string | null {
-    // Extract username from various formats
-    // e.g., "Twitter account found: @example" -> "example"
-    // e.g., "https://github.com/example" -> "example"
-
     const atMatch = data.match(/@(\w+)/);
     if (atMatch) return atMatch[1];
 
@@ -419,7 +538,6 @@ export class EnrichmentEngine {
     );
     if (urlMatch) return urlMatch[1];
 
-    // If it looks like just a username
     if (/^\w+$/.test(data.trim())) {
       return data.trim();
     }
@@ -461,7 +579,6 @@ export class EnrichmentEngine {
   }
 
   private fingerprint(event: SpiderFootEvent): string {
-    const crypto = require("crypto");
     const keyData = `${event.type}:${event.data}:${event.module}`;
     return crypto.createHash("md5").update(keyData).digest("hex");
   }

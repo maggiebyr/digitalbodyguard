@@ -13,6 +13,7 @@ const loginSchema = z.object({
 export const { handlers, auth, signIn, signOut } = NextAuth({
   adapter: PrismaAdapter(prisma),
   session: { strategy: "jwt" },
+  trustHost: true, // Required for production behind reverse proxy
   pages: {
     signIn: "/login",
     newUser: "/audit/new",

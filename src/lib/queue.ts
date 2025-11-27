@@ -95,25 +95,31 @@ export async function queueScan(scanId: string): Promise<void> {
     return;
   }
 
+  const webhookUrl = `${appUrl}/api/webhooks/scan-process`;
+
   try {
-    const response = await fetch("https://qstash.upstash.io/v2/publish", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${qstashToken}`,
-        "Content-Type": "application/json",
-        "Upstash-Forward-Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        url: `${appUrl}/api/webhooks/scan-process`,
-        body: { scanId },
-        retries: 3,
-        delay: "1s",
-      }),
-    });
+    // QStash v2 publish endpoint - URL goes in the path
+    const response = await fetch(
+      `https://qstash.upstash.io/v2/publish/${encodeURIComponent(webhookUrl)}`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${qstashToken}`,
+          "Content-Type": "application/json",
+          "Upstash-Retries": "3",
+          "Upstash-Delay": "1s",
+        },
+        body: JSON.stringify({ scanId }),
+      }
+    );
 
     if (!response.ok) {
-      throw new Error(`QStash error: ${response.status}`);
+      const errorText = await response.text();
+      throw new Error(`QStash error: ${response.status} - ${errorText}`);
     }
+
+    const result = await response.json();
+    console.log(`[QStash] Scan ${scanId} queued with message ID: ${result.messageId}`);
   } catch (error) {
     console.error("Failed to queue scan:", error);
     throw error;
