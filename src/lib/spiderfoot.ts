@@ -295,12 +295,10 @@ class SpiderFootClient {
 
   /**
    * Generate demo results for development/testing
+   * Returns completed results immediately for demo mode
    */
   private getDemoResults(scanId: string): ScanResult {
-    const elapsed = Date.now() - parseInt(scanId.replace("demo_scan_", ""));
-    const progress = Math.min(100, Math.floor(elapsed / 1000 / 3) * 10);
-    const isComplete = progress >= 100;
-
+    // In demo mode, return completed results immediately
     const demoEvents: SpiderFootEvent[] = [
       {
         type: "EMAILADDR_COMPROMISED",
@@ -315,6 +313,13 @@ class SpiderFootClient {
         data: "Found in Adobe data breach (2013)",
         source: "HaveIBeenPwned",
         confidence: 100,
+      },
+      {
+        type: "EMAILADDR_COMPROMISED",
+        module: "sfp_dehashed",
+        data: "Found in Dropbox data breach (2012)",
+        source: "DeHashed",
+        confidence: 95,
       },
       {
         type: "SOCIAL_MEDIA",
@@ -372,18 +377,20 @@ class SpiderFootClient {
         source: "Multiple Sites",
         confidence: 65,
       },
+      {
+        type: "PROFESSIONAL_INFO",
+        module: "sfp_clearbit",
+        data: "Works at Example Corp as Software Engineer",
+        source: "Clearbit",
+        confidence: 70,
+      },
     ];
-
-    const eventsToReturn = demoEvents.slice(
-      0,
-      Math.ceil((progress / 100) * demoEvents.length)
-    );
 
     return {
       scanId,
-      status: isComplete ? "completed" : "running",
-      events: eventsToReturn,
-      progress,
+      status: "completed",
+      events: demoEvents,
+      progress: 100,
     };
   }
 }
@@ -491,6 +498,13 @@ export class EnrichmentEngine {
     scanId: string,
     onProgress: (progress: number) => Promise<void> | void
   ): Promise<ScanResult> {
+    // Demo mode returns immediately
+    if (scanId.startsWith("demo_")) {
+      const result = await this.sf.getScanStatus(scanId);
+      await onProgress(100);
+      return result;
+    }
+
     let attempts = 0;
     const maxAttempts = 120; // 10 minutes max
 
