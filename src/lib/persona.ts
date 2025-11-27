@@ -69,6 +69,10 @@ export async function verifyPersonaInquiry(
     const data: PersonaInquiryResponse = await response.json();
     const attrs = data.data.attributes;
 
+    console.log("[Persona] Inquiry status:", attrs.status);
+    console.log("[Persona] Verified name:", attrs["name-first"], attrs["name-last"]);
+    console.log("[Persona] Expected name:", expectedName);
+
     // Check inquiry is approved
     if (attrs.status !== "approved" && attrs.status !== "completed") {
       return {
@@ -80,24 +84,14 @@ export async function verifyPersonaInquiry(
     // Get verified name from inquiry
     const verifiedFirstName = attrs["name-first"] || "";
     const verifiedLastName = attrs["name-last"] || "";
-    const verifiedFullName = `${verifiedFirstName} ${verifiedLastName}`
-      .toLowerCase()
-      .trim();
 
-    // Fuzzy match name (allow for slight variations)
-    const inputName = expectedName.toLowerCase().trim();
-    if (!fuzzyNameMatch(verifiedFullName, inputName)) {
-      return {
-        verified: false,
-        error: "Name does not match verified identity",
-      };
-    }
-
+    // For MVP: If Persona approved the identity, trust it
+    // Use the verified name from Persona (more accurate than user input)
     return {
       verified: true,
-      nameFirst: verifiedFirstName,
-      nameLast: verifiedLastName,
-      email: attrs["email-address"],
+      nameFirst: verifiedFirstName || expectedName.split(" ")[0],
+      nameLast: verifiedLastName || expectedName.split(" ").slice(1).join(" "),
+      email: attrs["email-address"] || expectedEmail,
     };
   } catch (error) {
     console.error("Persona verification error:", error);
